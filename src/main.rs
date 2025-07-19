@@ -1,4 +1,10 @@
 mod connect;
+mod error;
+mod session;
+mod config;
+mod executor;
+mod schema;
+mod spark;
 mod generated;
 
 use clap::{Parser, Subcommand};
@@ -61,20 +67,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run_flight_server(host: &str, port: u16, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     if verbose {
-        println!("🔧 Starting Sail Arrow Flight SQL Server in verbose mode...");
+        println!("Starting Sail Arrow Flight SQL Server in verbose mode...");
     } else {
-        println!("🚀 Starting Sail Arrow Flight SQL Server...");
+        println!("Starting Sail Arrow Flight SQL Server...");
     }
     
     let addr = format!("{}:{}", host, port).parse()?;
     let service = SailFlightService::new();
     
-    println!("📍 Server listening on {}", addr);
-    println!("🔗 JDBC clients can connect to: jdbc:arrow-flight-sql://{}:{}", host, port);
+    println!("Server listening on {}", addr);
+    println!("JDBC clients can connect to: jdbc:arrow-flight-sql://{}:{}", host, port);
     
     if verbose {
-        println!("📊 Verbose logging enabled");
-        println!("🔧 Server configuration:");
+        println!("* Verbose logging enabled");
+        println!("** Server configuration:");
         println!("   - Host: {}", host);
         println!("   - Port: {}", port);
         println!("   - Protocol: Arrow Flight SQL over gRPC");

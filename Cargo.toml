@@ -3,17 +3,55 @@ name = "sail"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "sail-flight-sql-server"
+path = "src/main.rs"
+
 [dependencies]
+sail-catalog = { path = "../sail-catalog" }
+sail-common = { path = "../sail-common" }
+sail-common-datafusion = { path = "../sail-common-datafusion" }
+sail-execution = { path = "../sail-execution" }
+sail-server = { path = "../sail-server" }
+sail-plan = { path = "../sail-plan" }
+sail-sql-analyzer = { path = "../sail-sql-analyzer" }
+sail-python-udf = { path = "../sail-python-udf" }
+sail-spark-connect = { path = "../sail-spark-connect" }
+sail-object-store = { path = "../sail-object-store" }
+
 arrow-flight = "55.2.0"
+arrow-schema = "55.2.0"
+arrow = "55.2.0"
 clap = { version = "4.0", features = ["derive"] }
+datafusion = { workspace = true }
+phf = { version = "0.11", features = ["macros"] }
+datafusion-proto = { workspace = true }
+datafusion-spark = { workspace = true }
+datafusion-functions-json = { workspace = true }
 futures = "0.3.31"
+async-stream = "0.3"
+log = { workspace = true }
+uuid = { workspace = true }
+
 prost = "0.13.5"
 prost-types = "0.13.5"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
 tokio = { version = "1.0", features = ["full"] }
 tokio-stream = "0.1.17"
 tonic = "0.12.3"
+tonic-types = { workspace = true }
 
 [build-dependencies]
 tonic-build = "0.12.3"
 prost-build = "0.13.5"
+pbjson-build = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+syn = { workspace = true }
+quote = { workspace = true }
+prettyplease = { workspace = true }
+regex = { workspace = true }
+phf = { version = "0.11", features = ["macros"] }
 

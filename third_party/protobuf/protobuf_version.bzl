@@ -1,7 +1,0 @@
-""" Contains version numbers to be used in other bzl files """
-PROTOC_VERSION = "32.0"
-PROTOBUF_JAVA_VERSION = "4.32.0"
-PROTOBUF_PYTHON_VERSION = "6.32.0"
-PROTOBUF_PHP_VERSION = "4.32.0"
-PROTOBUF_RUBY_VERSION = "4.32.0"
-PROTOBUF_RUST_VERSION = "4.32.0"

@@ -1,1 +1,17 @@
 /target
+
+# Generated protobuf files (created by prost-build)
+/generated/
+
+# Third-party dependencies (large protobuf repository)
+/third_party/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
