@@ -42,6 +42,7 @@ tokio = { version = "1.0", features = ["full"] }
 tokio-stream = "0.1.17"
 tonic = "0.12.3"
 tonic-types = { workspace = true }
+yansi = "1.0.1"
 
 [build-dependencies]
 tonic-build = "0.12.3"

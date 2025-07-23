@@ -4,6 +4,7 @@ use std::fmt::{Debug, Display};
 use std::ops::DerefMut;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+
 use tokio::time::Instant;
 use tokio::time::Duration;
 use tokio::sync::oneshot;
@@ -14,23 +15,29 @@ use arrow_flight::*;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
+
 use futures::{stream, Stream, StreamExt};
 use prost::Message;
 use sail_catalog::temp_view::TemporaryViewManager;
 use sail_common::config::{AppConfig, ExecutionMode};
-use sail_common::runtime::RuntimeHandle;
+use sail_common::runtime::RuntimeManager;
 use sail_execution::driver::DriverOptions;
 use sail_execution::job::{ClusterJobRunner, JobRunner, LocalJobRunner};
-use sail_plan::function::{
-    BUILT_IN_GENERATOR_FUNCTIONS,
-    BUILT_IN_SCALAR_FUNCTIONS,
-    BUILT_IN_TABLE_FUNCTIONS,
-};
+
+use sail_spark_connect::spark::connect::{SqlCommand, Relation};
+use sail_spark_connect;
+use sail_spark_connect::spark::connect::relation;
+use sail_spark_connect::spark::connect as sc;
+use sail_common::spec;
 use sail_plan::extension::analyzer::default_analyzer_rules;
 use sail_plan::extension::optimizer::default_optimizer_rules;
 use sail_plan::new_query_planner;
+use sail_plan::resolve_and_execute_plan;
 use sail_server::actor::{Actor, ActorAction, ActorContext, ActorHandle, ActorSystem};
 use sail_object_store::DynamicObjectStoreRegistry;
+
+// Import Sail's SQL analyzer for direct SQL parsing
+use sail_sql_analyzer;
 
 use tonic::{Request, Response, Status};
 use tonic::Streaming;
@@ -38,7 +45,6 @@ use tonic::Streaming;
 use crate::error::{SparkError, SparkResult};
 
 type TonicResult<T> = std::result::Result<T, Status>;
-use crate::spark::connect::SqlCommand;
 use crate::session::{SparkExtension, DEFAULT_SPARK_CATALOG, DEFAULT_SPARK_SCHEMA};
 
 // Import Flight SQL protobuf types
@@ -62,7 +68,7 @@ pub struct SailFlightService {
 impl SailFlightService {
     pub fn new() -> Self {
         let mut queries = HashMap::new();
-        
+
         let demo_data = vec![
             FlightData {
                 flight_descriptor: None,
@@ -88,14 +94,23 @@ impl SailFlightService {
     async fn execute_sql_query(&self, query: String) -> std::result::Result<Vec<FlightData>, Status> {
         println!("* Executing SQL query: {}", query.to_string());
         
-        let ctx = SessionContext::new();
+        // Create a proper SqlCommand using the protobuf-generated struct
+        let sql_command = SqlCommand {
+            sql: query.clone(), // This is the deprecated field, but we'll use it for now
+            args: std::collections::HashMap::new(),
+            pos_args: vec![],
+            named_arguments: std::collections::HashMap::new(),
+            pos_arguments: vec![],
+            input: None,
+        };
         
+        // Create a SessionContext with Sail extensions
+        let ctx = self.create_sail_session_context().await?;
         self.add_demo_data(&ctx).await?;
-        match ctx.sql(&query).await {
-            Ok(df) => {
-                let stream = df.execute_stream().await
-                    .map_err(|e| Status::internal(format!("Failed to execute query: {}", e)))?;
-
+        
+        // Use Sail's SQL execution flow instead of DataFusion's direct SQL
+        match self.execute_sail_sql(&ctx, sql_command).await {
+            Ok(stream) => {
                 let flight_data_stream = self.convert_to_flight_data(stream)?;
                 let mut flight_data = Vec::new();
                 tokio::pin!(flight_data_stream);
@@ -109,7 +124,7 @@ impl SailFlightService {
                 Ok(flight_data)
             }
             Err(e) => {
-                println!("* SQL execution error: {}", e);
+                println!("* Sail SQL execution error: {}", e);
                 // Return demo data as fallback
                 if let Some(data) = self.queries.lock().unwrap().get("demo_query") {
                     Ok(data.clone())
@@ -118,6 +133,106 @@ impl SailFlightService {
                 }
             }
         }
+    }
+    
+    async fn create_sail_session_context(&self) -> std::result::Result<SessionContext, Status> {
+        let config = AppConfig::load().map_err(|e| Status::internal(format!("Failed to load AppConfig: {}", e)))?;
+        
+        // Create RuntimeManager first, then get the handle
+        let runtime_manager = RuntimeManager::try_new(&config.runtime)
+            .map_err(|e| Status::internal(format!("Failed to create runtime manager: {}", e)))?;
+        let runtime_handle = runtime_manager.handle();
+        
+        let runtime = {
+            let registry = DynamicObjectStoreRegistry::new(runtime_handle.clone());
+            let builder = RuntimeEnvBuilder::default().with_object_store_registry(Arc::new(registry));
+            Arc::new(builder.build().map_err(|e| Status::internal(format!("Failed to build runtime: {}", e)))?)
+        };
+        
+        // Create a proper Sail session configuration
+        let mut session_config = SessionConfig::new()
+            .with_create_default_catalog_and_schema(true)
+            .with_default_catalog_and_schema(DEFAULT_SPARK_CATALOG, DEFAULT_SPARK_SCHEMA)
+            .with_information_schema(false)
+            .with_extension(Arc::new(TemporaryViewManager::default()));
+        
+        // Create job runner based on execution mode
+        let job_runner: Box<dyn JobRunner> = match config.mode {
+            ExecutionMode::Local => Box::new(LocalJobRunner::new()),
+            ExecutionMode::LocalCluster | ExecutionMode::KubernetesCluster => {
+                let options = DriverOptions::try_new(&config, runtime_handle.clone())
+                    .map_err(|e| Status::internal(format!("Failed to create driver options: {}", e)))?;
+                let mut system = self.system.lock().unwrap();
+                Box::new(ClusterJobRunner::new(system.deref_mut(), options))
+            }
+        };
+        
+        // Add Spark extension with proper session management
+        let spark_extension = SparkExtension::try_new(
+            None, // user_id - can be None for Flight SQL
+            "flight_sql_session".to_string(), // session_id
+            job_runner,
+        ).map_err(|e| Status::internal(format!("Failed to create Spark extension: {}", e)))?;
+        
+        session_config = session_config.with_extension(Arc::new(spark_extension));
+        
+        // Set execution options
+        {
+            let execution = &mut session_config.options_mut().execution;
+            execution.batch_size = config.execution.batch_size;
+            execution.collect_statistics = config.execution.collect_statistics;
+            execution.listing_table_ignore_subdirectory = false;
+        }
+        
+        let state = SessionStateBuilder::new()
+            .with_config(session_config)
+            .with_runtime_env(runtime)
+            .with_default_features()
+            .with_analyzer_rules(default_analyzer_rules())
+            .with_optimizer_rules(default_optimizer_rules())
+            .with_query_planner(new_query_planner())
+            .build();
+        
+        let context = SessionContext::new_with_state(state);
+        Ok(context)
+    }
+    
+    async fn execute_sail_sql(
+        &self, 
+        ctx: &SessionContext, 
+        sql_command: SqlCommand
+    ) -> std::result::Result<datafusion::physical_plan::SendableRecordBatchStream, Status> {
+        println!("* Executing SQL using Sail's own SQL parser and execution system");
+        
+        // Use Sail's SQL parser to parse the SQL string directly
+        let sql_query = sql_command.sql.clone();
+        println!("* Parsing SQL: {}", sql_query);
+        
+        // Parse the SQL using Sail's parser
+        let ast_statement = sail_sql_analyzer::parser::parse_one_statement(&sql_query)
+            .map_err(|e| Status::internal(format!("Failed to parse SQL: {}", e)))?;
+        
+        println!("* Successfully parsed SQL statement");
+        
+        // Convert AST statement to Sail Plan using Sail's analyzer
+        let sail_plan = sail_sql_analyzer::statement::from_ast_statement(ast_statement)
+            .map_err(|e| Status::internal(format!("Failed to convert AST to Sail plan: {}", e)))?;
+        
+        println!("* Successfully converted to Sail plan: {:?}", sail_plan);
+        
+        // Get the Spark extension to access Sail's configuration
+        let spark = SparkExtension::get(ctx)
+            .map_err(|e| Status::internal(format!("Failed to get Spark extension: {}", e)))?;
+        
+        // Use Sail's plan resolution and execution
+        let physical_plan = resolve_and_execute_plan(ctx, spark.plan_config()?, sail_plan).await
+            .map_err(|e| Status::internal(format!("Failed to resolve and execute Sail plan: {}", e)))?;
+        
+        println!("* Successfully resolved and executed Sail plan");
+        
+        // Execute the physical plan using Sail's job runner
+        spark.job_runner().execute(ctx, physical_plan).await
+            .map_err(|e| Status::internal(format!("Failed to execute physical plan: {}", e)))
     }
     
     async fn add_demo_data(&self, ctx: &SessionContext) -> std::result::Result<(), Status> {
@@ -560,8 +675,7 @@ impl Display for SessionKey {
 
 #[derive(Debug, Clone)]
 pub struct FlightSessionManagerOptions {
-    pub config: Arc<AppConfig>,
-    pub runtime: RuntimeHandle,
+    pub config: Arc<AppConfig>
 }
 
 pub struct FlightSessionManagerActor {
@@ -720,114 +834,114 @@ impl FlightSessionManager {
             .map_err(|e| SparkError::internal(format!("failed to get session: {e}")))?
     }
 
-    pub fn create_session_context(
-        system: Arc<Mutex<ActorSystem>>,
-        key: SessionKey,
-        options: FlightSessionManagerOptions,
-    ) -> SparkResult<SessionContext> {
-        let job_runner: Box<dyn JobRunner> = match options.config.mode {
-            ExecutionMode::Local => Box::new(LocalJobRunner::new()),
-            ExecutionMode::LocalCluster | ExecutionMode::KubernetesCluster => {
-                let options = DriverOptions::try_new(&options.config, options.runtime.clone())?;
-                let mut system = system.lock()?;
-                Box::new(ClusterJobRunner::new(system.deref_mut(), options))
-            }
-        };
-        // TODO: support more systematic configuration
-        // TODO: return error on invalid environment variables
-        let mut session_config = SessionConfig::new()
-            .with_create_default_catalog_and_schema(true)
-            .with_default_catalog_and_schema(DEFAULT_SPARK_CATALOG, DEFAULT_SPARK_SCHEMA)
-            // We do not use the information schema since we use the catalog/schema/table providers
-            // directly for catalog operations.
-            .with_information_schema(false)
-            .with_extension(Arc::new(TemporaryViewManager::default()))
-            .with_extension(Arc::new(SparkExtension::try_new(
-                key.user_id,
-                key.session_id,
-                job_runner,
-            )?));
+    // pub fn create_session_context(
+    //     system: Arc<Mutex<ActorSystem>>,
+    //     key: SessionKey,
+    //     options: FlightSessionManagerOptions,
+    // ) -> SparkResult<SessionContext> {
+    //     let job_runner: Box<dyn JobRunner> = match options.config.mode {
+    //         ExecutionMode::Local => Box::new(LocalJobRunner::new()),
+    //         ExecutionMode::LocalCluster | ExecutionMode::KubernetesCluster => {
+    //             let options = DriverOptions::try_new(&options.config, options.runtime.clone())?;
+    //             let mut system = system.lock()?;
+    //             Box::new(ClusterJobRunner::new(system.deref_mut(), options))
+    //         }
+    //     };
+    //     // TODO: support more systematic configuration
+    //     // TODO: return error on invalid environment variables
+    //     let mut session_config = SessionConfig::new()
+    //         .with_create_default_catalog_and_schema(true)
+    //         .with_default_catalog_and_schema(DEFAULT_SPARK_CATALOG, DEFAULT_SPARK_SCHEMA)
+    //         // We do not use the information schema since we use the catalog/schema/table providers
+    //         // directly for catalog operations.
+    //         .with_information_schema(false)
+    //         .with_extension(Arc::new(TemporaryViewManager::default()))
+    //         .with_extension(Arc::new(SparkExtension::try_new(
+    //             key.user_id,
+    //             key.session_id,
+    //             job_runner,
+    //         )?));
 
-        // execution options
-        {
-            let execution = &mut session_config.options_mut().execution;
+    //     // execution options
+    //     {
+    //         let execution = &mut session_config.options_mut().execution;
 
-            execution.batch_size = options.config.execution.batch_size;
-            execution.collect_statistics = options.config.execution.collect_statistics;
-            execution.listing_table_ignore_subdirectory = false;
-        }
+    //         execution.batch_size = options.config.execution.batch_size;
+    //         execution.collect_statistics = options.config.execution.collect_statistics;
+    //         execution.listing_table_ignore_subdirectory = false;
+    //     }
 
-        // execution Parquet options
-        {
-            let parquet = &mut session_config.options_mut().execution.parquet;
+    //     // execution Parquet options
+    //     {
+    //         let parquet = &mut session_config.options_mut().execution.parquet;
 
-            parquet.created_by = concat!("sail version ", env!("CARGO_PKG_VERSION")).into();
-            parquet.enable_page_index = options.config.parquet.enable_page_index;
-            parquet.pruning = options.config.parquet.pruning;
-            parquet.skip_metadata = options.config.parquet.skip_metadata;
-            parquet.metadata_size_hint = options.config.parquet.metadata_size_hint;
-            parquet.pushdown_filters = options.config.parquet.pushdown_filters;
-            parquet.reorder_filters = options.config.parquet.reorder_filters;
-            parquet.schema_force_view_types = options.config.parquet.schema_force_view_types;
-            parquet.binary_as_string = options.config.parquet.binary_as_string;
-            parquet.coerce_int96 = Some("us".to_string());
-            parquet.data_pagesize_limit = options.config.parquet.data_page_size_limit;
-            parquet.write_batch_size = options.config.parquet.write_batch_size;
-            parquet.writer_version = options.config.parquet.writer_version.clone();
-            parquet.skip_arrow_metadata = options.config.parquet.skip_arrow_metadata;
-            parquet.compression = Some(options.config.parquet.compression.clone());
-            parquet.dictionary_enabled = Some(options.config.parquet.dictionary_enabled);
-            parquet.dictionary_page_size_limit = options.config.parquet.dictionary_page_size_limit;
-            parquet.statistics_enabled = Some(options.config.parquet.statistics_enabled.clone());
-            parquet.max_row_group_size = options.config.parquet.max_row_group_size;
-            parquet.column_index_truncate_length =
-                options.config.parquet.column_index_truncate_length;
-            parquet.statistics_truncate_length = options.config.parquet.statistics_truncate_length;
-            parquet.data_page_row_count_limit = options.config.parquet.data_page_row_count_limit;
-            parquet.encoding = options.config.parquet.encoding.clone();
-            parquet.bloom_filter_on_read = options.config.parquet.bloom_filter_on_read;
-            parquet.bloom_filter_on_write = options.config.parquet.bloom_filter_on_write;
-            parquet.bloom_filter_fpp = Some(options.config.parquet.bloom_filter_fpp);
-            parquet.bloom_filter_ndv = Some(options.config.parquet.bloom_filter_ndv);
-            parquet.allow_single_file_parallelism =
-                options.config.parquet.allow_single_file_parallelism;
-            parquet.maximum_parallel_row_group_writers =
-                options.config.parquet.maximum_parallel_row_group_writers;
-            parquet.maximum_buffered_record_batches_per_stream = options
-                .config
-                .parquet
-                .maximum_buffered_record_batches_per_stream;
-        }
+    //         parquet.created_by = concat!("sail version ", env!("CARGO_PKG_VERSION")).into();
+    //         parquet.enable_page_index = options.config.parquet.enable_page_index;
+    //         parquet.pruning = options.config.parquet.pruning;
+    //         parquet.skip_metadata = options.config.parquet.skip_metadata;
+    //         parquet.metadata_size_hint = options.config.parquet.metadata_size_hint;
+    //         parquet.pushdown_filters = options.config.parquet.pushdown_filters;
+    //         parquet.reorder_filters = options.config.parquet.reorder_filters;
+    //         parquet.schema_force_view_types = options.config.parquet.schema_force_view_types;
+    //         parquet.binary_as_string = options.config.parquet.binary_as_string;
+    //         parquet.coerce_int96 = Some("us".to_string());
+    //         parquet.data_pagesize_limit = options.config.parquet.data_page_size_limit;
+    //         parquet.write_batch_size = options.config.parquet.write_batch_size;
+    //         parquet.writer_version = options.config.parquet.writer_version.clone();
+    //         parquet.skip_arrow_metadata = options.config.parquet.skip_arrow_metadata;
+    //         parquet.compression = Some(options.config.parquet.compression.clone());
+    //         parquet.dictionary_enabled = Some(options.config.parquet.dictionary_enabled);
+    //         parquet.dictionary_page_size_limit = options.config.parquet.dictionary_page_size_limit;
+    //         parquet.statistics_enabled = Some(options.config.parquet.statistics_enabled.clone());
+    //         parquet.max_row_group_size = options.config.parquet.max_row_group_size;
+    //         parquet.column_index_truncate_length =
+    //             options.config.parquet.column_index_truncate_length;
+    //         parquet.statistics_truncate_length = options.config.parquet.statistics_truncate_length;
+    //         parquet.data_page_row_count_limit = options.config.parquet.data_page_row_count_limit;
+    //         parquet.encoding = options.config.parquet.encoding.clone();
+    //         parquet.bloom_filter_on_read = options.config.parquet.bloom_filter_on_read;
+    //         parquet.bloom_filter_on_write = options.config.parquet.bloom_filter_on_write;
+    //         parquet.bloom_filter_fpp = Some(options.config.parquet.bloom_filter_fpp);
+    //         parquet.bloom_filter_ndv = Some(options.config.parquet.bloom_filter_ndv);
+    //         parquet.allow_single_file_parallelism =
+    //             options.config.parquet.allow_single_file_parallelism;
+    //         parquet.maximum_parallel_row_group_writers =
+    //             options.config.parquet.maximum_parallel_row_group_writers;
+    //         parquet.maximum_buffered_record_batches_per_stream = options
+    //             .config
+    //             .parquet
+    //             .maximum_buffered_record_batches_per_stream;
+    //     }
 
-        let runtime = {
-            let registry = DynamicObjectStoreRegistry::new(options.runtime.clone());
-            let builder =
-                RuntimeEnvBuilder::default().with_object_store_registry(Arc::new(registry));
-            Arc::new(builder.build()?)
-        };
-        let state = SessionStateBuilder::new()
-            .with_config(session_config)
-            .with_runtime_env(runtime)
-            .with_default_features()
-            .with_analyzer_rules(default_analyzer_rules())
-            .with_optimizer_rules(default_optimizer_rules())
-            .with_query_planner(new_query_planner())
-            .build();
-        let context = SessionContext::new_with_state(state);
+    //     let runtime = {
+    //         let registry = DynamicObjectStoreRegistry::new(options.runtime.clone());
+    //         let builder =
+    //             RuntimeEnvBuilder::default().with_object_store_registry(Arc::new(registry));
+    //         Arc::new(builder.build()?)
+    //     };
+    //     let state = SessionStateBuilder::new()
+    //         .with_config(session_config)
+    //         .with_runtime_env(runtime)
+    //         .with_default_features()
+    //         .with_analyzer_rules(default_analyzer_rules())
+    //         .with_optimizer_rules(default_optimizer_rules())
+    //         .with_query_planner(new_query_planner())
+    //         .build();
+    //     let context = SessionContext::new_with_state(state);
 
-        // TODO: This is a temp workaround to deregister all built-in functions that we define.
-        //   We should deregister all context.udfs() once we have better coverage of functions.
-        //   handler.rs needs to do this
-        for (&name, _function) in BUILT_IN_SCALAR_FUNCTIONS.iter() {
-            context.deregister_udf(name);
-        }
-        for (&name, _function) in BUILT_IN_GENERATOR_FUNCTIONS.iter() {
-            context.deregister_udf(name);
-        }
-        for (&name, _function) in BUILT_IN_TABLE_FUNCTIONS.iter() {
-            context.deregister_udtf(name);
-        }
+    //     // TODO: This is a temp workaround to deregister all built-in functions that we define.
+    //     //   We should deregister all context.udfs() once we have better coverage of functions.
+    //     //   handler.rs needs to do this
+    //     for (&name, _function) in BUILT_IN_SCALAR_FUNCTIONS.iter() {
+    //         context.deregister_udf(name);
+    //     }
+    //     for (&name, _function) in BUILT_IN_GENERATOR_FUNCTIONS.iter() {
+    //         context.deregister_udf(name);
+    //     }
+    //     for (&name, _function) in BUILT_IN_TABLE_FUNCTIONS.iter() {
+    //         context.deregister_udtf(name);
+    //     }
 
-        Ok(context)
-    }
+    //     Ok(context)
+    // }
 }

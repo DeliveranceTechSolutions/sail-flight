@@ -73,7 +73,10 @@ async fn run_flight_server(host: &str, port: u16, verbose: bool) -> Result<(), B
     }
     
     let addr = format!("{}:{}", host, port).parse()?;
+    println!("Parsed address: {}", addr);
+    
     let service = SailFlightService::new();
+    println!("Created SailFlightService");
     
     println!("Server listening on {}", addr);
     println!("JDBC clients can connect to: jdbc:arrow-flight-sql://{}:{}", host, port);
@@ -86,6 +89,7 @@ async fn run_flight_server(host: &str, port: u16, verbose: bool) -> Result<(), B
         println!("   - Protocol: Arrow Flight SQL over gRPC");
     }
     
+    println!("Starting gRPC server...");
     Server::builder()
         .add_service(FlightServiceServer::new(service))
         .serve(addr)
